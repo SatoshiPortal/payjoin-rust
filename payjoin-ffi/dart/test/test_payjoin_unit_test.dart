@@ -1,34 +1,47 @@
 import 'dart:typed_data';
+
 import 'package:convert/convert.dart';
 import 'package:test/test.dart';
 import "package:payjoin/payjoin.dart" as payjoin;
+
 import "utils.dart";
 
 void main() {
   group('Test URIs', () {
-    test('Test todo url encoded', () {
+    test('Test url userinfo rejection', () {
       var uri =
-          "bitcoin:12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX?amount=1&pj=https://example.com?ciao";
-      final result = payjoin.Url.parse(input: uri);
+          "bitcoin:12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX?amount=1&pj=https://example@evil.com?ciao";
       expect(
-        result,
-        isA<payjoin.Url>(),
-        reason: "pj url should be url encoded",
+        () => payjoin.Uri.parse(uri: uri),
+        throwsA(
+          isA<payjoin.UriParseException>().having(
+            (e) => e.toString(),
+            'display',
+            contains('UserinfoNotSupported'),
+          ),
+        ),
       );
+    });
+
+    test('Test url encoded', () {
+      var uri =
+          "bitcoin:12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX?amount=1&pj=https%3A%2F%2Fexample.com%3Fciao";
+      final result = payjoin.Uri.parse(uri: uri);
+      expect(result, isA<payjoin.Uri>(), reason: "pj url encoded is not valid");
     });
 
     test('Test valid url', () {
       var uri =
           "bitcoin:12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX?amount=1&pj=https://example.com?ciao";
-      final result = payjoin.Url.parse(input: uri);
-      expect(result, isA<payjoin.Url>(), reason: "pj is not a valid url");
+      final result = payjoin.Uri.parse(uri: uri);
+      expect(result, isA<payjoin.Uri>(), reason: "pj is not a valid url");
     });
 
     test('Test missing amount', () {
       var uri =
           "bitcoin:12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX?pj=https://testnet.demo.btcpayserver.org/BTC/pj";
-      final result = payjoin.Url.parse(input: uri);
-      expect(result, isA<payjoin.Url>(), reason: "missing amount should be ok");
+      final result = payjoin.Uri.parse(uri: uri);
+      expect(result, isA<payjoin.Uri>(), reason: "missing amount should be ok");
     });
 
     test('Test valid uris', () {
@@ -47,7 +60,7 @@ void main() {
         for (final pj in pjs) {
           final uri = "$address?amount=1&pj=$pj";
           try {
-            payjoin.Url.parse(input: uri);
+            payjoin.Uri.parse(uri: uri);
           } catch (e) {
             fail("Failed to create a valid Uri for $uri. Error: $e");
           }
@@ -307,8 +320,7 @@ void main() {
 
     test("Validation sender builder rejects bad psbt", () {
       final uri = payjoin.Uri.parse(
-        uri:
-            "bitcoin:tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4?pj=https://example.com/pj",
+        uri: "bitcoin:tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4?pj=https://example.com/pj",
       ).checkPjSupported();
       expect(
         () => payjoin.SenderBuilder(psbt: "not-a-psbt", uri: uri),

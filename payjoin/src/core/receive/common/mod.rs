@@ -32,13 +32,21 @@ pub struct OriginalContext {
 impl OriginalContext {
     /// Live and replay both route through here so the param sanitization can't diverge.
     pub(super) fn new(original_psbt: Psbt, mut params: Params, owned_vouts: &[usize]) -> Self {
-        if let Some((_, additional_fee_output_index)) = params.additional_fee_contribution {
+        if let Some((max_additional_fee_contribution, additional_fee_output_index)) =
+            params.additional_fee_contribution
+        {
             // Per BIP78, ignore a fee-contribution index that is out of bounds or
             // pointing at a receiver output.
-            // https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#optional-parameters
-            if additional_fee_output_index >= original_psbt.unsigned_tx.output.len()
-                || owned_vouts.contains(&additional_fee_output_index)
-            {
+            // https://github.com/bitcoin/bips/master/bip-0078.mediawiki#optional-parameters
+            // Also ignore a contribution the fee output cannot pay for:
+            // subtracting more than the output's value would underflow.
+            let fee_output = original_psbt.unsigned_tx.output.get(additional_fee_output_index);
+            let in_valid_range = match fee_output {
+                Some(fee_output) if !owned_vouts.contains(&additional_fee_output_index) =>
+                    fee_output.value.checked_sub(max_additional_fee_contribution).is_some(),
+                _ => false,
+            };
+            if !in_valid_range {
                 params.additional_fee_contribution = None;
             }
         }
@@ -92,11 +100,16 @@ impl WantsOutputs {
     }
 
     /// Substitute the receiver output script with the provided script.
+    ///
+    /// Like [`Self::replace_receiver_outputs`], this leaves the receiver holding a single
+    /// output, carrying the drain output's value. Any further receiver outputs a prior
+    /// call added are dropped, and their value goes to fees.
     pub fn substitute_receiver_script(
         self,
         output_script: &Script,
     ) -> Result<Self, OutputSubstitutionError> {
-        let output_value = self.original.original_psbt.unsigned_tx.output[self.change_vout].value;
+        // `change_vout` indexes the payjoin PSBT's outputs, not the original's.
+        let output_value = self.payjoin_psbt.unsigned_tx.output[self.change_vout].value;
         let outputs = [TxOut { value: output_value, script_pubkey: output_script.into() }];
         self.replace_receiver_outputs(outputs, output_script)
     }
@@ -305,7 +318,13 @@ impl WantsInputs {
 
         for input_pair in candidate_inputs {
             let candidate_sats = input_pair.previous_txout().value;
-            let candidate_min_out = min(min_out_sats, prior_payment_sats + candidate_sats);
+            // The receiver output value is sender-supplied, so this sum can overflow.
+            let candidate_min_out = min(
+                min_out_sats,
+                prior_payment_sats
+                    .checked_add(candidate_sats)
+                    .ok_or(InternalCoinSelectionError::AmountOverflow)?,
+            );
             let candidate_min_in = min(min_in_sats, candidate_sats);
 
             if candidate_min_in > candidate_min_out {
@@ -366,9 +385,9 @@ impl WantsInputs {
 
         // Insert contributions at random indices for privacy
         let mut rng = rand::thread_rng();
-        let mut receiver_input_amount = Amount::ZERO;
+        let receiver_input_amount =
+            checked_sum(inputs.iter().map(|input_pair| input_pair.previous_txout().value))?;
         for input_pair in inputs.clone() {
-            receiver_input_amount += input_pair.previous_txout().value;
             let index = rng.gen_range(0..=self.proposal.payjoin_psbt.unsigned_tx.input.len());
             payjoin_psbt.inputs.insert(index, input_pair.psbtin);
             payjoin_psbt
@@ -378,10 +397,15 @@ impl WantsInputs {
         }
 
         // Add the receiver change amount to the receiver change output, if applicable
-        let receiver_min_input_amount = self.receiver_min_input_amount();
+        let receiver_min_input_amount = self.receiver_min_input_amount()?;
         if receiver_input_amount >= receiver_min_input_amount {
             let change_amount = receiver_input_amount - receiver_min_input_amount;
-            payjoin_psbt.unsigned_tx.output[self.proposal.change_vout].value += change_amount;
+            // The change output's starting value is sender-supplied, so this can overflow.
+            let change_output = &mut payjoin_psbt.unsigned_tx.output[self.proposal.change_vout];
+            change_output.value = change_output
+                .value
+                .checked_add(change_amount)
+                .ok_or(InternalInputContributionError::AmountOverflow)?;
         } else {
             return Err(InternalInputContributionError::ValueTooLow.into());
         }
@@ -400,22 +424,14 @@ impl WantsInputs {
     }
 
     // Compute the minimum amount that the receiver must contribute to the transaction as input.
-    fn receiver_min_input_amount(&self) -> Amount {
-        let output_amount = self
-            .proposal
-            .payjoin_psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .fold(Amount::ZERO, |acc, output| acc + output.value);
-        let original_output_amount = self
-            .original
-            .original_psbt
-            .unsigned_tx
-            .output
-            .iter()
-            .fold(Amount::ZERO, |acc, output| acc + output.value);
-        output_amount.checked_sub(original_output_amount).unwrap_or(Amount::ZERO)
+    //
+    // Output values are sender-supplied, so either sum can overflow.
+    fn receiver_min_input_amount(&self) -> Result<Amount, InputContributionError> {
+        let output_amount =
+            checked_sum(self.proposal.payjoin_psbt.unsigned_tx.output.iter().map(|o| o.value))?;
+        let original_output_amount =
+            checked_sum(self.original.original_psbt.unsigned_tx.output.iter().map(|o| o.value))?;
+        Ok(output_amount.checked_sub(original_output_amount).unwrap_or(Amount::ZERO))
     }
 
     /// Commits the inputs as final, and moves on to the next typestate.
@@ -424,6 +440,15 @@ impl WantsInputs {
     pub fn commit_inputs(self) -> WantsFeeRange {
         WantsFeeRange { original: self.original, proposal: self.proposal }
     }
+}
+
+fn checked_sum(
+    amounts: impl IntoIterator<Item = Amount>,
+) -> Result<Amount, InputContributionError> {
+    amounts
+        .into_iter()
+        .try_fold(Amount::ZERO, |acc, amount| acc.checked_add(amount))
+        .ok_or(InternalInputContributionError::AmountOverflow.into())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -481,7 +506,7 @@ impl WantsFeeRange {
                     .unsigned_tx
                     .output
                     .iter()
-                    .position(|txo| txo.script_pubkey == sender_fee_output.script_pubkey)
+                    .position(|txo| txo == sender_fee_output)
                     .expect("Sender output is missing from payjoin PSBT");
                 // Determine the additional amount that the sender will pay in fees
                 let sender_additional_fee = min(max_additional_fee_contribution, additional_fee);
@@ -507,9 +532,18 @@ impl WantsFeeRange {
             return Err(InternalPayloadError::FeeTooHigh(proposed_fee_rate, max_fee_rate));
         }
         if receiver_additional_fee >= Amount::ONE_SAT {
-            // Remove additional miner fee from the receiver's specified output
-            payjoin_psbt.unsigned_tx.output[self.proposal.change_vout].value -=
-                receiver_additional_fee;
+            // Remove additional miner fee from the receiver's specified output.
+            // Reject rather than underflow when a small payment plus a high
+            // sender minfeerate makes the fee exceed the change output's value.
+            let change_output = &mut payjoin_psbt.unsigned_tx.output[self.proposal.change_vout];
+            change_output.value =
+                change_output.value.checked_sub(receiver_additional_fee).ok_or_else(|| {
+                    InternalPayloadError::FeeTooHigh(
+                        receiver_additional_fee
+                            / (input_contribution_weight + output_contribution_weight),
+                        max_fee_rate,
+                    )
+                })?;
         }
         Ok(payjoin_psbt)
     }
@@ -535,7 +569,10 @@ impl WantsFeeRange {
             .output
             .iter()
             .fold(Weight::ZERO, |acc, txo| acc + txo.weight());
-        let output_contribution_weight = payjoin_outputs_weight - original_outputs_weight;
+        // If the receiver's substitution shrank the total output size, the
+        // contribution is negative; treat it as zero rather than underflowing.
+        let output_contribution_weight =
+            payjoin_outputs_weight.checked_sub(original_outputs_weight).unwrap_or(Weight::ZERO);
         tracing::trace!("output_contribution_weight : {output_contribution_weight}");
         output_contribution_weight
     }
@@ -1177,6 +1214,89 @@ mod tests {
         assert_eq!(sender_out.value, sender_value_before - sender_additional_fee);
     }
 
+    // The receiver may add an output that reuses the sender's fee output script, and
+    // the interleave shuffle can place it ahead of the sender's output. Matching the
+    // fee output by script alone would then debit the receiver's output instead of the
+    // sender's, so the lookup must match the whole `TxOut`.
+    #[test]
+    fn fee_contribution_resolves_duplicate_script_to_sender_output() {
+        let original = original_from_test_vector();
+        let sender_fee_output = original.psbt.unsigned_tx.output[0].clone();
+        let wants_outputs = WantsOutputs::new(original, vec![1]);
+        let receiver_script =
+            wants_outputs.payjoin_psbt.unsigned_tx.output[1].script_pubkey.clone();
+        let receiver_value = wants_outputs.payjoin_psbt.unsigned_tx.output[1].value;
+
+        // A receiver output that shares the sender's fee script but not its value,
+        // carved out of the receiver's own output so the transaction stays balanced.
+        let lookalike = TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: sender_fee_output.script_pubkey.clone(),
+        };
+        assert_ne!(lookalike.value, sender_fee_output.value);
+        let receiver_output = TxOut {
+            value: receiver_value - lookalike.value,
+            script_pubkey: receiver_script.clone(),
+        };
+        let mut rng = StdRng::seed_from_u64(0);
+        let wants_outputs = (0..64)
+            .find_map(|_| {
+                let candidate = wants_outputs
+                    .clone()
+                    .replace_receiver_outputs_with_rng(
+                        [receiver_output.clone(), lookalike.clone()],
+                        &receiver_script,
+                        &mut rng,
+                    )
+                    .expect("substitution should succeed");
+                (candidate.payjoin_psbt.unsigned_tx.output[0] == lookalike).then_some(candidate)
+            })
+            .expect("shuffle should place the lookalike ahead of the sender output");
+        let sender_vout = wants_outputs
+            .payjoin_psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .position(|txo| *txo == sender_fee_output)
+            .expect("sender output must survive substitution");
+        assert!(sender_vout > 0, "lookalike must precede the sender output");
+
+        let proposal_psbt = Psbt::from_str(RECEIVER_INPUT_CONTRIBUTION).unwrap();
+        let input = InputPair::new(
+            proposal_psbt.unsigned_tx.input[1].clone(),
+            proposal_psbt.inputs[1].clone(),
+            None,
+        )
+        .unwrap();
+        let wants_fee_range = wants_outputs
+            .commit_outputs()
+            .contribute_inputs([input])
+            .expect("contribution should succeed")
+            .commit_inputs();
+        let (max_contribution, _) = wants_fee_range
+            .original
+            .params
+            .additional_fee_contribution
+            .expect("contribution should survive sanitization");
+
+        let psbt = wants_fee_range
+            .calculate_psbt_with_fee_range(
+                Some(FeeRate::from_sat_per_vb_u32(10)),
+                Some(FeeRate::from_sat_per_vb_u32(1000)),
+            )
+            .expect("fee range should be valid");
+
+        assert_eq!(
+            psbt.unsigned_tx.output[0], lookalike,
+            "receiver's lookalike output must be untouched"
+        );
+        assert_eq!(
+            psbt.unsigned_tx.output[sender_vout].value,
+            sender_fee_output.value - max_contribution,
+            "sender's output must carry the fee contribution"
+        );
+    }
+
     // A sender-supplied `additionalfeeoutputindex` past the end of the original outputs
     // must be dropped at sanitization. Before the bounds check it survived (an
     // out-of-bounds index is never an owned vout) and `calculate_psbt_with_fee_range`
@@ -1212,5 +1332,269 @@ mod tests {
                 Some(FeeRate::from_sat_per_vb_u32(1000)),
             )
             .expect("fee calculation should succeed without the sender contribution");
+    }
+
+    // A `maxadditionalfeecontribution` outside the valid range — greater than
+    // the fee output's value — must be ignored at sanitization so the
+    // receiver, not the sender output, pays the additional fee, rather than
+    // clamped or underflowing the output's Amount subtraction.
+    #[test]
+    fn excessive_fee_contribution_is_ignored() {
+        let mut original = original_from_test_vector();
+        let sender_script = original.psbt.unsigned_tx.output[0].script_pubkey.clone();
+        // Fee index 0 is a sender output when the receiver owns vout 1, so the
+        // contribution survives the index checks; the 100_000_000 sat
+        // contribution exceeds the output's 95983068 sat value and is out of
+        // range.
+        original.params.additional_fee_contribution = Some((Amount::from_sat(100_000_000), 0));
+
+        let wants_inputs = WantsOutputs::new(original, vec![1]).commit_outputs();
+        assert_eq!(
+            wants_inputs.original.params.additional_fee_contribution, None,
+            "out-of-range fee contribution must be dropped at sanitization"
+        );
+
+        let proposal_psbt = Psbt::from_str(RECEIVER_INPUT_CONTRIBUTION).unwrap();
+        let input = InputPair::new(
+            proposal_psbt.unsigned_tx.input[1].clone(),
+            proposal_psbt.inputs[1].clone(),
+            None,
+        )
+        .unwrap();
+        let wants_fee_range = wants_inputs
+            .contribute_inputs([input])
+            .expect("contribution should succeed")
+            .commit_inputs();
+
+        let psbt = wants_fee_range
+            .calculate_psbt_with_fee_range(
+                Some(FeeRate::from_sat_per_vb_u32(1000)),
+                Some(FeeRate::from_sat_per_vb_u32(1000)),
+            )
+            .expect("receiver must cover the fee without the sender contribution");
+
+        let sender_out = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .find(|txo| txo.script_pubkey == sender_script)
+            .expect("sender output must be present");
+        assert_eq!(sender_out.value, Amount::from_sat(95_983_068));
+    }
+
+    // A contribution of exactly the fee output's value is the top of the
+    // valid range and must survive sanitization; one sat more must be dropped.
+    #[test]
+    fn fee_contribution_value_boundary() {
+        let mut original = original_from_test_vector();
+        let max_contribution = original.psbt.unsigned_tx.output[0].value;
+
+        original.params.additional_fee_contribution = Some((max_contribution, 0));
+        let wants_outputs = WantsOutputs::new(original.clone(), vec![1]);
+        assert_eq!(
+            wants_outputs.original.params.additional_fee_contribution,
+            Some((max_contribution, 0)),
+            "a contribution of exactly the output's value is in range"
+        );
+
+        original.params.additional_fee_contribution = Some((max_contribution + Amount::ONE_SAT, 0));
+        let wants_outputs = WantsOutputs::new(original, vec![1]);
+        assert_eq!(
+            wants_outputs.original.params.additional_fee_contribution, None,
+            "a contribution above the output's value is out of range"
+        );
+    }
+
+    // A receiver fee exceeding the receiver change output's value must return
+    // FeeTooHigh instead of panicking on the Amount subtraction.
+    #[test]
+    fn receiver_fee_exceeding_change_outputs_fee_too_high() {
+        use crate::receive::InternalPayloadError;
+
+        let original = original_from_test_vector();
+        let mut wants_fee_range =
+            WantsOutputs::new(original, vec![0]).commit_outputs().commit_inputs();
+        let payjoin_psbt = &mut wants_fee_range.proposal.payjoin_psbt;
+        // A large additional output makes the receiver owe substantial weight
+        // fees while the change output stays too small to cover them.
+        payjoin_psbt.unsigned_tx.output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; 10_000]),
+        });
+        payjoin_psbt.outputs.push(Default::default());
+        payjoin_psbt.unsigned_tx.output[0].value = Amount::from_sat(100);
+
+        // Equal min and max rates so the max_fee check passes and only the
+        // change-value check fires.
+        let fee_rate = FeeRate::from_sat_per_vb_u32(25_000);
+        let result = wants_fee_range.calculate_psbt_with_fee_range(Some(fee_rate), Some(fee_rate));
+        match result {
+            Err(InternalPayloadError::FeeTooHigh(proposed, max)) => {
+                assert_eq!(max, fee_rate);
+                assert!(proposed > FeeRate::BROADCAST_MIN);
+            }
+            _ => panic!("expected FeeTooHigh when receiver fee exceeds change output"),
+        }
+    }
+
+    // A receiver fee that drains the change output below zero cannot be
+    // subtracted and must error rather than underflow. A change output
+    // covering the fee exactly must succeed and leave a zero-value output;
+    // keeping the remaining output above dust is deferred to a follow-up.
+    #[test]
+    fn receiver_fee_at_change_value_boundary() {
+        use crate::receive::InternalPayloadError;
+
+        let original = original_from_test_vector();
+        let mut wants_fee_range =
+            WantsOutputs::new(original, vec![0]).commit_outputs().commit_inputs();
+        let payjoin_psbt = &mut wants_fee_range.proposal.payjoin_psbt;
+        // One extra 1-byte-script output contributes 8 + 1 + 1 = 10 bytes
+        // = 40 weight units, so at 1 sat/vb (250 sat/kwu) the receiver fee is
+        // exactly ceil(40 * 250 / 1000) = 10 sats.
+        payjoin_psbt
+            .unsigned_tx
+            .output
+            .push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) });
+        payjoin_psbt.outputs.push(Default::default());
+        payjoin_psbt.unsigned_tx.output[0].value = Amount::from_sat(9);
+
+        // Equal min and max rates so the max_fee check passes and only the
+        // change-value boundary is exercised.
+        let fee_rate = FeeRate::from_sat_per_vb_u32(1);
+        let result = wants_fee_range.calculate_psbt_with_fee_range(Some(fee_rate), Some(fee_rate));
+        match result {
+            Err(InternalPayloadError::FeeTooHigh(proposed, max)) => {
+                assert_eq!(proposed, fee_rate);
+                assert_eq!(max, fee_rate);
+            }
+            _ => panic!("expected FeeTooHigh when the fee exceeds the change output's value"),
+        }
+
+        // Covering the 10 sat fee exactly must succeed and leave zero sats.
+        let mut wants_fee_range = WantsOutputs::new(original_from_test_vector(), vec![0])
+            .commit_outputs()
+            .commit_inputs();
+        let payjoin_psbt = &mut wants_fee_range.proposal.payjoin_psbt;
+        payjoin_psbt
+            .unsigned_tx
+            .output
+            .push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::from_bytes(vec![0x51]) });
+        payjoin_psbt.outputs.push(Default::default());
+        payjoin_psbt.unsigned_tx.output[0].value = Amount::from_sat(10);
+        let psbt = wants_fee_range
+            .calculate_psbt_with_fee_range(Some(fee_rate), Some(fee_rate))
+            .expect("change covering the fee exactly must not error");
+        assert_eq!(psbt.unsigned_tx.output[0].value, Amount::ZERO);
+    }
+
+    // Substituting a receiver output script smaller than the original shrinks
+    // the total output weight; the Weight subtraction must saturate at zero
+    // instead of underflowing.
+    #[test]
+    fn shrinking_output_substitution_does_not_underflow() {
+        let original = original_from_test_vector();
+        let mut wants_fee_range =
+            WantsOutputs::new(original, vec![0]).commit_outputs().commit_inputs();
+        wants_fee_range.proposal.payjoin_psbt.unsigned_tx.output[0].script_pubkey =
+            ScriptBuf::new();
+
+        let psbt = wants_fee_range
+            .calculate_psbt_with_fee_range(None, None)
+            .expect("shrinking substitution must not underflow output weight");
+        assert!(psbt.unsigned_tx.output[0].script_pubkey.is_empty());
+    }
+
+    // The seeds cover both placements of the drain: beyond the original output count,
+    // and in range at a moved position.
+    #[test]
+    fn substitute_after_replace_keeps_drain_value() {
+        let original = original_from_test_vector();
+        let orig_len = original.psbt.unsigned_tx.output.len();
+        let wants_outputs = WantsOutputs::new(original, vec![0]);
+        let drain = ScriptBuf::from_bytes(vec![0x51, 0x53]);
+        let drain_value = Amount::from_sat(10_000);
+        let replacements = vec![
+            TxOut { value: drain_value, script_pubkey: drain.clone() },
+            TxOut {
+                value: Amount::from_sat(20_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x54]),
+            },
+            TxOut {
+                value: Amount::from_sat(30_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x55]),
+            },
+        ];
+        let new_script = ScriptBuf::from_bytes(vec![0x51, 0x56]);
+        let mut saw_beyond_original = false;
+        let mut saw_moved_in_range = false;
+        for seed in 0..64u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let replaced = wants_outputs
+                .clone()
+                .replace_receiver_outputs_with_rng(replacements.clone(), &drain, &mut rng)
+                .expect("substitution succeeds");
+            let change_vout = replaced.change_vout;
+            saw_beyond_original |= change_vout >= orig_len;
+            saw_moved_in_range |= change_vout != 0 && change_vout < orig_len;
+            let next = replaced
+                .substitute_receiver_script(new_script.as_script())
+                .expect("script substitution succeeds");
+            let substituted = &next.payjoin_psbt.unsigned_tx.output[next.change_vout];
+            assert_eq!(substituted.script_pubkey, new_script, "seed {seed}");
+            assert_eq!(substituted.value, drain_value, "seed {seed}");
+        }
+        assert!(saw_beyond_original, "no seed placed the drain beyond the original output count");
+        assert!(saw_moved_in_range, "no seed moved the drain within the original output range");
+    }
+
+    // The overflow is in the output sums, before any change is credited.
+    #[test]
+    fn contribute_inputs_errors_on_overflowing_original_outputs() {
+        let mut original = original_from_test_vector();
+        original.psbt.unsigned_tx.output[0].value = Amount::from_sat(u64::MAX);
+        original.psbt.unsigned_tx.output[1].value = Amount::from_sat(u64::MAX);
+
+        let wants_inputs = WantsOutputs::new(original, vec![0]).commit_outputs();
+        let candidate = candidate_input_from_test_vector(Amount::from_sat(3_000_000));
+
+        assert_eq!(
+            wants_inputs.contribute_inputs([candidate]).unwrap_err(),
+            InputContributionError::from(InternalInputContributionError::AmountOverflow)
+        );
+    }
+
+    // The output sums stay within u64, so the overflow is the change credit.
+    #[test]
+    fn contribute_inputs_errors_crediting_change_to_inflated_output() {
+        let mut original = original_from_test_vector();
+        original.psbt.unsigned_tx.output[0].value = Amount::from_sat(u64::MAX - 10);
+        original.psbt.unsigned_tx.output[1].value = Amount::from_sat(5);
+
+        let wants_inputs = WantsOutputs::new(original, vec![0]).commit_outputs();
+        let candidate = candidate_input_from_test_vector(Amount::from_sat(3_000_000));
+
+        assert_eq!(
+            wants_inputs.contribute_inputs([candidate]).unwrap_err(),
+            InputContributionError::from(InternalInputContributionError::AmountOverflow)
+        );
+    }
+
+    #[test]
+    fn avoid_uih_errors_on_overflowing_receiver_output() {
+        let mut original = original_from_test_vector();
+        original.psbt.unsigned_tx.output[0].value = Amount::from_sat(u64::MAX);
+
+        let wants_inputs = WantsOutputs::new(original, vec![0]).commit_outputs();
+        let candidate = candidate_input_from_test_vector(Amount::from_sat(3_000_000));
+
+        assert_eq!(
+            wants_inputs.avoid_uih(std::slice::from_ref(&candidate)).unwrap_err(),
+            CoinSelectionError::from(InternalCoinSelectionError::AmountOverflow)
+        );
+        let selected = wants_inputs
+            .try_preserving_privacy([candidate.clone()])
+            .expect("falls back to the first candidate");
+        assert_eq!(selected, candidate);
     }
 }

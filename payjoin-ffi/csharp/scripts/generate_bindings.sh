@@ -25,11 +25,16 @@ fi
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+cd "$REPO_ROOT"
+source contrib/lockfile.sh
+use_lockfile Cargo-recent.lock
+
 # Navigate to payjoin-ffi directory (parent of csharp, which is parent of scripts)
 cd "$SCRIPT_DIR/../.."
 
 echo "Generating payjoin C#..."
-# Keep parity with other language test scripts: include _test-utils by default.
 PAYJOIN_FFI_FEATURES=${PAYJOIN_FFI_FEATURES-_test-utils}
 PAYJOIN_FFI_PROFILE=${PAYJOIN_FFI_PROFILE:-dev}
 if [[ $PAYJOIN_FFI_PROFILE == "dev" ]]; then

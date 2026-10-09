@@ -1,5 +1,104 @@
 # Payjoin Changelog
 
+## Unreleased
+
+## 1.2.0
+
+This release adds a non-blocking interface to the receiver state machine.
+Every step that previously required a synchronous validation closure is
+now split in two: a method that extracts the data to be checked, and a
+method that submits the results and advances the typestate. Wallets whose
+signing, broadcast checks, or ownership lookups are asynchronous, or that
+live in a separate process from the code driving the session, can now
+drive both the v1 and v2 receiver flows without blocking. The existing
+callback methods remain as convenience wrappers, so this release is
+backward compatible.
+
+Selected Improvements:
+
+### API Additions
+
+- Split every callback-based receiver transition into an extract/apply
+  pair, available on both the v1 and v2 receiver flows:
+  `extract_tx_to_check_broadcast_suitability` and
+  `apply_broadcast_suitability`, `inputs_owned_checklist` and
+  `apply_inputs_owned_checklist`, `inputs_seen_checklist` and
+  `apply_inputs_seen_checklist`, `outputs_owned_checklist` and
+  `apply_outputs_owned_checklist`, and `psbt_to_sign` and
+  `finalize_signed_proposal` (#1446)
+- Add `ChecklistItem`, `MarkedChecklistItem`, and the sealed
+  `ChecklistKind` trait with the `InputOwnership`, `InputSeenBefore`, and
+  `OutputOwnership` kinds, plus a `mark_checklist` helper for integrators
+  that prefer a closure. A submitted checklist must match the inputs or
+  outputs of the receiver's own original PSBT (#1446)
+
+### Bug Fixes
+
+- Reject proposals that drop or reorder the sender's original inputs
+  before classifying any input as sender or receiver contributed. Input
+  classification treated any proposed input whose outpoint did not match
+  an original one as receiver-contributed, so a receiver that altered a
+  sender outpoint was validated as though the receiver had contributed
+  it. Dropped and reordered inputs are now both rejected up front with
+  `MissingOrShuffledInputs` (#1836)
+
+## 1.1.0
+
+This release hardens how both sides of a payjoin validate what the
+counterparty sends. Fee rates, fee arithmetic, PSBT amounts, endpoint URLs,
+and directory responses are now checked before they can overflow, panic, or
+redirect a request. It deprecates the v2 `SenderBuilder::new` constructor,
+which panics on a BIP 78 only endpoint, and raises the minimum rust-bitcoin
+version.
+
+Selected Improvements:
+
+### Deprecations
+
+- `send::v2::SenderBuilder::new` is deprecated because it panics when the
+  URI's `pj` endpoint is BIP 78 only. Use `SenderBuilder::from_parts` with
+  the v2 `PjParam` from the parsed URI, and handle v1 endpoints explicitly
+  (#1884)
+
+### Dependencies
+
+- Raise the minimum `bitcoin` version from 0.32.9 to 0.32.102 and
+  `bitcoin-units` from 0.1.3 to 0.1.101. Cargo already resolved 1.0.0 to
+  these versions, so most dependents see no change (#1879)
+- Raise `bitcoin-hpke` from 0.13.0 to 0.20.0 and `bitcoin-ohttp` from 0.6.0 to
+  0.7.0. Neither crate appears in payjoin's public API, so dependents need no
+  change (#1817)
+- The crate now uses Rust edition 2024. The MSRV stays at 1.85 (#1874)
+
+### Features
+
+- Add an optional `arbitrary` feature with an `Arbitrary` implementation for
+  `Url`, for use in fuzzing (#1662)
+- `PersistedError` and the v1 receiver `RequestError` implement `PartialEq`
+  (#1873)
+
+### Bug Fixes
+
+- Reject userinfo in endpoint URLs with the new
+  `ParseError::UserinfoNotSupported`, and reject malformed ports instead of
+  storing them in the path. `http://x.onion:1@evil.com/pj` previously passed
+  the v1 onion check and sent the Original PSBT to `evil.com` in cleartext
+  (#1896)
+- Reject Original PSBT output and input UTXO values above `MAX_MONEY`, and use
+  checked addition when the receiver contributes inputs, so a crafted PSBT
+  can no longer panic the receiver. The sender runs the same check on its own
+  Original PSBT. `substitute_receiver_script` now reads the receiver output
+  value from the payjoin PSBT (#1897)
+- Harden fee handling on both sides. The receiver rejects NaN, negative, and
+  above-ceiling `minfeerate` values, ignores a sender fee contribution larger
+  than the output meant to pay it, and returns `FeeTooHigh` instead of
+  panicking when its fee exceeds its change output. Both sender and receiver
+  now check fee rate arithmetic for overflow and underflow (#1845, #1889)
+- Cap the size of OHTTP key responses from the directory and return the new
+  `io::Error::OhttpKeysBodyTooLarge` when a response exceeds it (#1846)
+- The receiver rejects mailbox responses too short to decrypt instead of
+  panicking (#1843)
+
 ## 1.0.0
 
 The first stable release of the payjoin library supports both synchronous

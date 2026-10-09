@@ -7,12 +7,23 @@ package readme.
 ## Versioning
 
 - The package version is set in `Payjoin.csproj` (`<Version>`).
-- It tracks the `payjoin-ffi` crate version from `payjoin-ffi/Cargo.toml`,
-  with a `-preview.N` suffix while the C# API stabilizes. For example,
-  `0.24.0-preview.1` packages `payjoin-ffi 0.24.0`. Pre-release suffixes
-  follow [SemVer], per NuGet's [package versioning] guidance.
-- Bump only the `-preview.N` suffix for packaging-only fixes. Bump
-  `MAJOR.MINOR.PATCH` together with a `payjoin-ffi` version bump.
+- It is the package's own semantic version, independent of the
+  `payjoin-ffi` crate version. The language bindings follow a
+  `{version}+payjoin-{version}` convention: the [SemVer] build metadata
+  names the wrapped payjoin core release, so `0.1.0+payjoin-1.0.0`
+  packages payjoin 1.0.0. NuGet accepts build metadata per its
+  [package versioning] guidance but ignores it for version comparison
+  and strips it from the `.nupkg` filename, so the package identity is
+  the bare version.
+- Bump `MAJOR.MINOR.PATCH` for C# API changes, and update the build
+  metadata whenever the wrapped payjoin core version changes.
+- A release that only changes the wrapped payjoin core version still
+  needs at least a patch bump: the package identity ignores the build
+  metadata, and nuget.org rejects republishing an identity that
+  already exists.
+- Versions up to `0.24.0-preview.1` tracked the `payjoin-ffi` crate
+  version instead. They predate this scheme and are unlisted on
+  nuget.org so they do not resolve as the latest version.
 - `Payjoin.csproj` is the only place the version is maintained: the CI smoke
   test derives the version from the packed artifact.
 
@@ -57,8 +68,9 @@ Review before every publish to nuget.org. Grounded in the NuGet
 - [ ] Native assets are release-profile builds without `_test-utils` (the
       pack step's validation target enforces both; confirm it ran in CI).
 - [ ] The package is under nuget.org's 250 MB size limit.
-- [ ] Package version in `Payjoin.csproj` matches `payjoin-ffi`'s crate
-      version plus the intended pre-release suffix.
+- [ ] Package version in `Payjoin.csproj` carries the intended C# version
+      and its `+payjoin-{version}` build metadata matches the wrapped
+      payjoin core release.
 
 ### Metadata and trust
 
@@ -104,12 +116,18 @@ is ever stored. The workflow is
 
 1. Work through the release readiness checklist above on the release commit in
    `master`; confirm every `Build and Test CSharp` job is green.
-2. Tag that commit `payjoin-csharp-<version>`, where `<version>` is the
-   `Payjoin.csproj` `<Version>` exactly, and push the tag:
+2. Tag that commit with `contrib/release/tag.sh` and push the tag it
+   names. The tag is `payjoin-csharp-<version>`, where `<version>` is the
+   `Payjoin.csproj` `<Version>` exactly, build metadata included, as
+   [`contrib/release-version.sh`](contrib/release-version.sh) prints it.
+   NuGet strips the metadata from the `Payjoin.<version>.nupkg` filename,
+   so the publish job strips it from the tag as well before comparing.
+   tag.sh signs it with your key, which must be in `contrib/release/keys/` for
+   `verify-tag` to accept it, refuses a commit that is not on `master`,
+   and prints the push command.
 
    ```shell
-   git tag payjoin-csharp-0.24.0-preview.1
-   git push upstream payjoin-csharp-0.24.0-preview.1
+   nix develop .#release -c contrib/release/tag.sh csharp
    ```
 
    The tag reruns the full build/pack/smoke graph at the tagged commit, then
@@ -126,42 +144,4 @@ is ever stored. The workflow is
    the attestation:
    `gh attestation verify Payjoin.<version>.nupkg -R payjoin/rust-payjoin`.
 
-One-time setup — the nuget.org Trusted Publishing policy (bound to
-`payjoin/rust-payjoin`, workflow file `csharp.yml`, environment
-`release`), the `release` GitHub Actions environment with required
-reviewers, and the `NUGET_USER` secret (the publishing member's nuget.org
-profile name) — is a one-time account and repository configuration, not part
-of the per-release flow.
-
-## Manual fallback
-
-Use only if the CI publish path is unavailable. Requires a maintainer with
-nuget.org ownership of the `Payjoin` package ID.
-
-1. Work through the release readiness checklist above.
-2. Download the CI-built `payjoin-csharp-nuget-package` artifact from the
-   workflow run on the release commit (do not pack from a development machine —
-   a local pack only contains the native assets present on that host), then
-   push it:
-
-   ```shell
-   dotnet nuget push Payjoin.<version>.nupkg \
-       --source https://api.nuget.org/v3/index.json \
-       --api-key <nuget.org API key>
-   ```
-
-   Prefer a scoped, push-only, short-expiry key per [scoped API keys], or the
-   `NUGET_API_KEY` environment variable (.NET SDK 10.0.300+) so the key never
-   appears in shell history.
-
-3. Complete the post-publish verification section of the checklist.
-
-[SemVer]: https://semver.org/
-[package versioning]: https://learn.microsoft.com/en-us/nuget/concepts/package-versioning
-[publish guide]: https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package
-[package authoring best practices]: https://learn.microsoft.com/en-us/nuget/create-packages/package-authoring-best-practices
-[native library packaging]: https://learn.microsoft.com/en-us/nuget/create-packages/native-files-in-net-packages
-[readme preview]: https://learn.microsoft.com/en-us/nuget/nuget-org/package-readme-on-nuget-org
-[scoped API keys]: https://learn.microsoft.com/en-us/nuget/nuget-org/scoped-api-keys
 [trusted publishing]: https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing
-[`NuGet/login`]: https://github.com/NuGet/login
