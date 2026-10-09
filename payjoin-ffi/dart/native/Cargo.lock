@@ -286,6 +286,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoin-hpke"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b82f6af50f93d6dcda676e622840c128044cd0ba7771aab00aed5fa8208adee3"
+dependencies = [
+ "aead 0.5.2",
+ "bitcoin_hashes",
+ "chacha20-poly1305",
+ "generic-array",
+ "rand_core 0.6.4",
+ "secp256k1",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "bitcoin-internals"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -308,7 +324,7 @@ checksum = "87a803a4b54e44635206b53329c78c0029d0c70926288ac2f07f4bb1267546cb"
 dependencies = [
  "aead 0.4.3",
  "aes-gcm",
- "bitcoin-hpke",
+ "bitcoin-hpke 0.13.0",
  "byteorder",
  "chacha20poly1305 0.8.0",
  "hex",
@@ -319,6 +335,26 @@ dependencies = [
  "serde",
  "serde_derive",
  "sha2 0.9.9",
+ "thiserror 1.0.69",
+ "toml 0.5.11",
+]
+
+[[package]]
+name = "bitcoin-ohttp"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea931154237aee3527fc6bc529cf2c8e3b045f81044ee2215b760df2a722c38b"
+dependencies = [
+ "bitcoin-hpke 0.20.0",
+ "bitcoin_hashes",
+ "byteorder",
+ "chacha20-poly1305",
+ "hex",
+ "lazy_static",
+ "log",
+ "rand 0.8.7",
+ "serde",
+ "serde_derive",
  "thiserror 1.0.69",
  "toml 0.5.11",
 ]
@@ -571,6 +607,12 @@ dependencies = [
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
 ]
+
+[[package]]
+name = "chacha20-poly1305"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50844998c477072ba2cb2a63fa1dfca81b1368133f38084916bccd5710a374e1"
 
 [[package]]
 name = "chacha20poly1305"
@@ -1720,8 +1762,8 @@ checksum = "764bdfb07333876342956b942c3b61214e9cca29bc17bf6895bb023763927ac2"
 dependencies = [
  "bhttp 0.5.1",
  "bitcoin",
- "bitcoin-hpke",
- "bitcoin-ohttp",
+ "bitcoin-hpke 0.13.0",
+ "bitcoin-ohttp 0.6.0",
  "bitcoin_uri",
  "http",
  "log",
@@ -1734,14 +1776,14 @@ dependencies = [
 
 [[package]]
 name = "payjoin"
-version = "1.0.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44bff1a63fc33a2109b313a1d2123334c440cc4593603271cb1c56a68db191af"
+checksum = "18e76ccf869704cc4830eb1b527a7fc08ced2006b37a8ee29e3417d4ef13cb50"
 dependencies = [
  "bhttp 0.6.1",
  "bitcoin",
- "bitcoin-hpke",
- "bitcoin-ohttp",
+ "bitcoin-hpke 0.20.0",
+ "bitcoin-ohttp 0.7.0",
  "bitcoin-units",
  "bitcoin_uri",
  "hkdf 0.12.4",
@@ -1762,7 +1804,7 @@ dependencies = [
  "anyhow",
  "bhttp 0.5.1",
  "bitcoin",
- "bitcoin-ohttp",
+ "bitcoin-ohttp 0.6.0",
  "futures",
  "http-body-util",
  "hyper",
@@ -1780,14 +1822,12 @@ dependencies = [
 [[package]]
 name = "payjoin-ffi"
 version = "0.24.0"
-source = "git+https://github.com/payjoin/rust-payjoin.git?rev=e4f5a0b384462458b3d68aeec042c20ceffb8d80#e4f5a0b384462458b3d68aeec042c20ceffb8d80"
+source = "git+https://github.com/payjoin/rust-payjoin.git?rev=8e072970f74040832342369e6319a4db53cd2b6f#8e072970f74040832342369e6319a4db53cd2b6f"
 dependencies = [
  "async-trait",
  "getrandom 0.2.17",
- "icu_locale_core",
- "icu_provider",
  "lazy_static",
- "payjoin 1.0.0",
+ "payjoin 1.2.0",
  "payjoin-test-utils",
  "serde",
  "serde_json",
@@ -1795,7 +1835,7 @@ dependencies = [
  "tokio",
  "uniffi",
  "uniffi-dart",
- "url",
+ "yoke-derive",
 ]
 
 [[package]]
@@ -1803,6 +1843,7 @@ name = "payjoin-ffi-wrapper"
 version = "0.1.0"
 dependencies = [
  "payjoin-ffi",
+ "yoke-derive",
 ]
 
 [[package]]
@@ -1812,7 +1853,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8fbcd2894f1726b17d5a85c17175af1af7831b1f4286fe6bf5c59d3c8b7c78e"
 dependencies = [
  "bitcoin",
- "bitcoin-ohttp",
+ "bitcoin-ohttp 0.6.0",
  "bitcoincore-rpc",
  "bitcoind",
  "http",

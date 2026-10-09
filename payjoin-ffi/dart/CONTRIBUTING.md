@@ -33,7 +33,7 @@ Maintainer instructions for publishing to
 ### Versioning
 
 Versions take the form `<package version>+payjoin-<crate version>`, for
-example `0.2.1+payjoin-1.0.0-rc.8`. The part before the `+` is the package's
+example `0.3.0+payjoin-1.2.0`. The part before the `+` is the package's
 own semantic version, and is what consumers write version constraints
 against. The build metadata after it records which `payjoin` release the
 bindings wrap, so the pub.dev listing names the supported protocol version
@@ -79,13 +79,7 @@ opt-in; missing or other values keep the production feature set. The
 `contrib/test.sh` script sets this variable because its integration tests use
 the test helper bindings.
 
-Known limitation: `scripts/generate_bindings.sh` always builds with
-`_test-utils`, so the bindings it emits declare test-only APIs such as
-`TestServices` and `BitcoindEnv`. Consumers build the native library without
-that feature, which leaves those declarations backed by symbols that are
-absent at runtime. Every release so far ships them. Giving the script a
-production mode, as `payjoin-ffi/csharp` does with `PAYJOIN_FFI_FEATURES`,
-remains to be done.
+`scripts/generate_bindings.sh` supports `PAYJOIN_FFI_FEATURES=""` for production bindings and defaults to `_test-utils` for the test suite. The publish preparation script retains and validates the production `native/Cargo.lock`.
 
 ## Checking native reproducibility
 

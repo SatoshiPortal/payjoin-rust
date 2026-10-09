@@ -18,7 +18,7 @@
 
 use bitcoin::psbt::{Psbt, PsbtSighashType};
 use bitcoin::sighash::TapSighashType;
-use bitcoin::{Amount, FeeRate, Script, ScriptBuf, TxOut, Weight};
+use bitcoin::{Amount, FeeRate, Script, ScriptBuf, TxIn, TxOut, Weight};
 pub use error::{BuildSenderError, ResponseError, ValidationError, WellKnownError};
 pub(crate) use error::{InternalBuildSenderError, InternalProposalError, InternalValidationError};
 
@@ -285,6 +285,21 @@ fn commits_to_all_inputs_and_outputs(sighash_type: PsbtSighashType) -> bool {
     matches!(sighash_type.taproot_hash_ty(), Ok(TapSighashType::Default | TapSighashType::All))
 }
 
+/// Whether `originals` appear among `proposed` in the same relative order.
+///
+/// BIP 78 forbids the receiver from shuffling: its additional inputs "must be inserted at a
+/// random index", so the sender's inputs must survive as an ordered subsequence of the
+/// proposal's.
+fn is_ordered_subsequence<'a>(
+    originals: impl IntoIterator<Item = &'a TxIn>,
+    proposed: impl IntoIterator<Item = &'a TxIn>,
+) -> bool {
+    let mut proposed = proposed.into_iter();
+    originals
+        .into_iter()
+        .all(|original| proposed.any(|p| p.previous_output == original.previous_output))
+}
+
 impl PsbtContext {
     fn process_proposal(self, mut proposal: Psbt) -> InternalResult<Psbt> {
         self.basic_checks(&proposal)?;
@@ -339,8 +354,11 @@ impl PsbtContext {
         )?;
         if self.min_fee_rate > FeeRate::ZERO {
             let proposed_weight = proposal.clone().extract_tx_unchecked_fee_rate().weight();
+            let proposed_fee_rate = proposed_fee
+                .div_by_weight_floor(proposed_weight)
+                .ok_or(InternalProposalError::FeeCalculationOverflow)?;
             ensure(
-                proposed_fee / proposed_weight >= self.min_fee_rate,
+                proposed_fee_rate >= self.min_fee_rate,
                 InternalProposalError::FeeRateBelowMinimum,
             )?;
         }
@@ -367,6 +385,14 @@ impl PsbtContext {
         proposal: &Psbt,
         ensure_receiver_input_finalized: bool,
     ) -> InternalResult<()> {
+        ensure(
+            is_ordered_subsequence(
+                &self.original_psbt.unsigned_tx.input,
+                &proposal.unsigned_tx.input,
+            ),
+            InternalProposalError::MissingOrShuffledInputs,
+        )?;
+
         let mut original_inputs = self.original_psbt.input_pairs().peekable();
 
         for proposed in proposal.input_pairs() {
@@ -609,14 +635,10 @@ fn check_fee_output_amount(
     fee: bitcoin::Amount,
     clamp_fee_contribution: bool,
 ) -> Result<bitcoin::Amount, InternalBuildSenderError> {
-    if output.value < fee {
-        if clamp_fee_contribution {
-            Ok(output.value)
-        } else {
-            Err(InternalBuildSenderError::FeeOutputValueLowerThanFeeContribution)
-        }
-    } else {
-        Ok(fee)
+    match output.value.checked_sub(fee) {
+        Some(_) => Ok(fee),
+        None if clamp_fee_contribution => Ok(output.value),
+        None => Err(InternalBuildSenderError::FeeOutputValueLowerThanFeeContribution),
     }
 }
 
@@ -679,12 +701,15 @@ fn determine_fee_contribution(
     fee_contribution: Option<(bitcoin::Amount, Option<usize>)>,
     clamp_fee_contribution: bool,
 ) -> Result<Option<AdditionalFeeContribution>, InternalBuildSenderError> {
-    Ok(match fee_contribution {
+    let contribution = match fee_contribution {
         Some((fee, None)) => find_change_index(psbt, payee, fee, clamp_fee_contribution)?,
         Some((fee, Some(index))) =>
             Some(check_change_index(psbt, payee, fee, index, clamp_fee_contribution)?),
         None => None,
-    })
+    };
+    // A clamped zero contribution offers the receiver nothing and would only
+    // advertise a fee output the receiver must leave untouched.
+    Ok(contribution.filter(|contribution| contribution.max_amount > bitcoin::Amount::ZERO))
 }
 
 fn serialize_url(
@@ -717,10 +742,11 @@ mod test {
     use bitcoin::absolute::LockTime;
     use bitcoin::bip32::{DerivationPath, Fingerprint};
     use bitcoin::ecdsa::Signature;
+    use bitcoin::hashes::Hash;
     use bitcoin::hex::FromHex;
     use bitcoin::secp256k1::{Message, PublicKey, Secp256k1, SecretKey, SECP256K1};
     use bitcoin::taproot::TaprootBuilder;
-    use bitcoin::{Amount, FeeRate, OutPoint, Script, ScriptBuf, Sequence, Witness};
+    use bitcoin::{Amount, FeeRate, OutPoint, Script, ScriptBuf, Sequence, Txid, Witness};
     use payjoin_test_utils::{
         BoxError, ADDITIONAL_FEE_OUTPUT_INDEX, MAX_ADDITIONAL_FEE_CONTRIBUTION,
         PARSED_ORIGINAL_PSBT, PARSED_PAYJOIN_PROPOSAL, PARSED_PAYJOIN_PROPOSAL_WITH_SENDER_INFO,
@@ -745,6 +771,29 @@ mod test {
             min_fee_rate: FeeRate::ZERO,
             payee,
         })
+    }
+
+    #[test]
+    fn ordered_subsequence_requires_original_order() {
+        let txin = |vout| TxIn {
+            previous_output: OutPoint::new(Txid::all_zeros(), vout),
+            ..Default::default()
+        };
+        let originals = vec![txin(0), txin(1)];
+
+        assert!(is_ordered_subsequence(&originals, &vec![txin(0), txin(1)]));
+        // Receiver inputs may be inserted before, between, and after the sender's.
+        assert!(is_ordered_subsequence(&originals, &vec![txin(0), txin(9), txin(1)]));
+        assert!(is_ordered_subsequence(
+            &originals,
+            &vec![txin(3), txin(0), txin(9), txin(1), txin(3)]
+        ));
+        assert!(!is_ordered_subsequence(
+            &originals,
+            &vec![txin(3), txin(1), txin(9), txin(0), txin(3)]
+        ));
+        assert!(!is_ordered_subsequence(&originals, &vec![txin(1), txin(0)]));
+        assert!(!is_ordered_subsequence(&originals, &vec![txin(0)]));
     }
 
     #[test]
@@ -815,6 +864,25 @@ mod test {
     }
 
     #[test]
+    fn test_build_recommended_payee_is_first_output() -> Result<(), BoxError> {
+        let mut psbt = PARSED_ORIGINAL_PSBT.clone();
+        psbt.unsigned_tx.output.swap(0, 1);
+        psbt.outputs.swap(0, 1);
+        let payee = psbt.unsigned_tx.output[0].script_pubkey.clone();
+
+        let psbt_ctx = PsbtContextBuilder::new(psbt, payee, None)
+            .build_recommended(FeeRate::BROADCAST_MIN, OutputSubstitution::Disabled)?;
+
+        // The change output moved to vout 1, and it is the only output that can
+        // pay the receiver's input fee.
+        let fee_contribution =
+            psbt_ctx.fee_contribution.expect("sender should contribute fees from change");
+        assert_eq!(fee_contribution.vout, 1);
+        assert_eq!(fee_contribution.max_amount, Amount::from_sat(91));
+        Ok(())
+    }
+
+    #[test]
     fn test_determine_fees() -> Result<(), BoxError> {
         let fee_contribution = determine_fee_contribution(
             &PARSED_ORIGINAL_PSBT,
@@ -852,10 +920,56 @@ mod test {
             Script::from_bytes(&<Vec<u8> as FromHex>::from_hex(
                 "0014b60943f60c3ee848828bdace7474a92e81f3fcdd",
             )?),
+            // The change output (vout 0) holds 95983068 sats, so the
+            // contribution must not exceed the output's value.
             Some((Amount::from_sat(95983068), None)),
             false,
         );
         assert!(fee_contribution.is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_fee_contribution_above_output_value() -> Result<(), BoxError> {
+        let payee_script = ScriptBuf::from_hex("0014b60943f60c3ee848828bdace7474a92e81f3fcdd")?;
+        let mut psbt = PARSED_ORIGINAL_PSBT.clone();
+        psbt.unsigned_tx.output[0].value = Amount::from_sat(1000);
+
+        // A contribution above the 1000 sat output's value must be rejected
+        // rather than offered to the receiver.
+        let fee_contribution = determine_fee_contribution(
+            &psbt,
+            &payee_script,
+            Some((Amount::from_sat(1500), None)),
+            false,
+        );
+        assert_eq!(
+            fee_contribution,
+            Err(InternalBuildSenderError::FeeOutputValueLowerThanFeeContribution)
+        );
+
+        // With clamping, the contribution is decreased to the output's value.
+        let fee_contribution = determine_fee_contribution(
+            &psbt,
+            &payee_script,
+            Some((Amount::from_sat(1500), None)),
+            true,
+        );
+        assert_eq!(
+            fee_contribution,
+            Ok(Some(AdditionalFeeContribution { max_amount: Amount::from_sat(1000), vout: 0 }))
+        );
+
+        // An output that cannot afford any contribution contributes nothing
+        // at all.
+        psbt.unsigned_tx.output[0].value = Amount::ZERO;
+        let fee_contribution = determine_fee_contribution(
+            &psbt,
+            &payee_script,
+            Some((Amount::from_sat(1000), None)),
+            true,
+        );
+        assert_eq!(fee_contribution, Ok(None));
         Ok(())
     }
 
@@ -1132,6 +1246,31 @@ mod test {
         Ok(())
     }
 
+    #[test]
+    fn test_fee_calculation_overflow() -> Result<(), BoxError> {
+        let mut ctx = create_psbt_context()?;
+        // The guard only runs when a minimum fee rate was requested.
+        ctx.min_fee_rate = FeeRate::from_sat_per_vb_u32(1);
+
+        let mut proposal = ctx.original_psbt.clone();
+        // A malicious receiver claims an absurd value for an input it
+        // contributed. Anything above u64::MAX / 1000 sats makes the
+        // sat/kwu conversion overflow, which used to wrap silently in
+        // release builds and could pass the min-fee-rate check.
+        proposal.inputs[0]
+            .witness_utxo
+            .as_mut()
+            .expect("test vector input has a witness utxo")
+            .value = Amount::MAX;
+
+        let err = ctx
+            .check_fees(&proposal, Amount::ZERO)
+            .expect_err("Fee rate should not be computable from an overflowing fee");
+        assert!(matches!(err, InternalProposalError::FeeCalculationOverflow));
+
+        Ok(())
+    }
+
     /// Test the sender's payjoin proposal checklist
     /// See: https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#user-content-Senders_payjoin_proposal_checklist
     /// TODO: update the BIP78 spec, see the sighash check in [`PsbtContextBuilder::build`].
@@ -1238,6 +1377,19 @@ mod test {
                     original
                 }) if proposed == proposed_sequence && original == original_sequence
             ));
+            Ok(())
+        }
+
+        #[test]
+        fn test_sender_input_outpoint_changed() -> Result<(), BoxError> {
+            let ctx = create_psbt_context()?;
+            let mut proposal: bitcoin::Psbt = PARSED_PAYJOIN_PROPOSAL.clone();
+            proposal.unsigned_tx.input[0].previous_output.vout += 1;
+
+            assert_eq!(
+                ctx.process_proposal(proposal).unwrap_err().to_string(),
+                InternalProposalError::MissingOrShuffledInputs.to_string()
+            );
             Ok(())
         }
 
@@ -1397,14 +1549,9 @@ mod test {
             let ctx = create_psbt_context()?;
             let mut proposal: bitcoin::Psbt = PARSED_PAYJOIN_PROPOSAL.clone();
 
-            // If the outpoints are different, they are considered a receiver input and will be checked as such
-            let proposed_outpoint = proposal.unsigned_tx.input.first().unwrap().previous_output;
-            proposal.unsigned_tx.input.get_mut(0).unwrap().previous_output =
-                OutPoint::new(proposed_outpoint.txid, proposed_outpoint.vout + 1);
-
-            // Make the receiver's input un-finalized
-            proposal.inputs.get_mut(0).unwrap().final_script_sig = None;
-            proposal.inputs.get_mut(0).unwrap().final_script_witness = None;
+            // Make the receiver's input unfinalized.
+            proposal.inputs.get_mut(1).unwrap().final_script_sig = None;
+            proposal.inputs.get_mut(1).unwrap().final_script_witness = None;
 
             assert_eq!(
                 ctx.process_proposal(proposal).unwrap_err().to_string(),
@@ -1419,16 +1566,9 @@ mod test {
             let ctx = create_psbt_context()?;
             let mut proposal: bitcoin::Psbt = PARSED_PAYJOIN_PROPOSAL.clone();
 
-            // If the outpoints are different, they are considered a receiver input and will be checked as such
-            let proposed_outpoint = proposal.unsigned_tx.input.first().unwrap().previous_output;
-            proposal.unsigned_tx.input.get_mut(0).unwrap().previous_output =
-                OutPoint::new(proposed_outpoint.txid, proposed_outpoint.vout + 1);
-            proposal.inputs.get_mut(0).unwrap().final_script_sig = Some(ScriptBuf::new());
-            proposal.inputs.get_mut(0).unwrap().final_script_witness = Some(Witness::new());
-
-            // Make the receiver's input un-finalized
-            proposal.inputs.get_mut(0).unwrap().witness_utxo = None;
-            proposal.inputs.get_mut(0).unwrap().non_witness_utxo = None;
+            // Remove the receiver's UTXO information.
+            proposal.inputs.get_mut(1).unwrap().witness_utxo = None;
+            proposal.inputs.get_mut(1).unwrap().non_witness_utxo = None;
 
             assert_eq!(
                 ctx.process_proposal(proposal).unwrap_err().to_string(),
@@ -1443,16 +1583,9 @@ mod test {
             let mut ctx = create_psbt_context()?;
             let mut proposal: bitcoin::Psbt = PARSED_PAYJOIN_PROPOSAL.clone();
 
-            // If the outpoints are different, they are considered a receiver input and will be checked as such
-            let proposed_outpoint = proposal.unsigned_tx.input.first().unwrap().previous_output;
-            proposal.unsigned_tx.input.get_mut(0).unwrap().previous_output =
-                OutPoint::new(proposed_outpoint.txid, proposed_outpoint.vout + 1);
-            proposal.inputs.get_mut(0).unwrap().final_script_sig = Some(ScriptBuf::new());
-            proposal.inputs.get_mut(0).unwrap().final_script_witness = Some(Witness::new());
-
             // Ensure the sequence is different
             let sequence = ctx.original_psbt.unsigned_tx.input.get_mut(0).unwrap().sequence;
-            proposal.unsigned_tx.input.get_mut(0).unwrap().sequence =
+            proposal.unsigned_tx.input.get_mut(1).unwrap().sequence =
                 Sequence::from_consensus(sequence.to_consensus_u32() + 1);
 
             assert_eq!(

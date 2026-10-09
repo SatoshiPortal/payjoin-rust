@@ -16,9 +16,28 @@ Most discussion about Payjoin research and development happens on [Discord](http
 
 ---
 
+## Scope
+
+Issues and pull requests are for technical substance. Foundation
+governance, personnel, and licensing or IP matters are out of scope. Take
+them to [Foundation leadership](https://payjoin.org/foundation/) directly at
+[hello@payjoin.org](mailto:hello@payjoin.org). Maintainers may lock or hide
+off-topic threads by pointing to this section, and may temporarily block
+accounts for sustained off-topic participation, with notice.
+
+---
+
 ## Issues
 
 Using and testing Payjoin Dev Kit is an effective way for new contributors to both learn and provide value. If you find a bug, incorrect or unclear documentation, or have any other problem, consider [creating an issue](https://github.com/payjoin/rust-payjoin/issues). Before doing so, please search through [existing issues](https://github.com/payjoin/rust-payjoin/issues) to see if your problem has already been addressed or is actively being discussed. If you can, provide a fully reproducible example or the steps we can use to reproduce the issue to speed up the debugging process.
+
+---
+
+## Security
+
+Do not open public issues or pull requests for vulnerabilities. Report them
+privately to [security@payjoin.org](mailto:security@payjoin.org) as described
+in [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -35,6 +54,8 @@ Good documentation is essential to understanding what PDK does and how to use it
 If you're looking for somewhere to start contributing code changes, see the [good first issue](https://github.com/payjoin/rust-payjoin/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22good%20first%20issue%22) list. If you intend to start working on an issue, please leave a comment stating your intent.
 
 If you find a perceived issue like a bug or existing `// TODO` comment, please open an issue first to ensure that the behavior you wish to change can be agreed upon before you sit down to write the fix in earnest.
+
+Before you open a pull request, get sign-off on the change from a maintainer or trusted contributor (see [Review and Merging](#review-and-merging)). Sign-off is a comment on the issue agreeing that the change is worth making and that the proposed approach is sound. Link to the issue in the pull request description. Pull requests opened without sign-off will be closed.
 
 To contribute a code change:
 
@@ -87,6 +108,12 @@ fi
 
 echo "✓  Pre-commit hook passed"
 ```
+
+### Changelog
+
+Each release crate (`payjoin`, `payjoin-cli`, `payjoin-mailroom`) keeps a `CHANGELOG.md` with an `## Unreleased` section at the top. If your pull request changes what a user of that crate sees, add a line there in the same commit. Write it for the person reading the release notes, not for the reviewer. The release PR renames the heading to the version number and nothing else.
+
+If the change has no user-visible effect (refactoring, tests, CI, comments), say so in the pull request description and a maintainer will apply the `changelog: none` label. CI fails a pull request that touches a release crate's `src/` without either a changelog line or that label.
 
 ## AI Assistance Notice
 
@@ -152,3 +179,46 @@ nix fmt
 ### Linting
 
 We use [`clippy`](https://github.com/rust-lang/rust-clippy) for linting. Please run `contrib/lint.sh` using the nightly toolchain before submitting any changes.
+
+---
+
+## Review and Merging
+
+Pull requests are reviewed on technical merit. The maintainers are
+[@benalleng](https://github.com/benalleng),
+[@DanGould](https://github.com/DanGould), and
+[@spacebear21](https://github.com/spacebear21), and only a maintainer
+merges. Trusted contributors
+[@chavic](https://github.com/chavic) and
+[@xstoicunicornx](https://github.com/xstoicunicornx) also review and may
+approve.
+
+No one is assigned to review your pull request automatically. Choosing a
+reviewer is part of preparing the change. Think about who is best placed
+to judge it, usually the person who agreed to the approach on its issue
+or who knows the code it touches.
+`git shortlog -sn --no-merges -- <paths>` lists who has worked on the
+files you changed. Name your chosen reviewer in the pull request
+description. If they can't take it, they will point you to someone who
+can.
+
+Protocol wire behavior follows the BIP process
+([BIP 78](https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki),
+[BIP 77](https://github.com/bitcoin/bips/blob/master/bip-0077.md)).
+Observable behavior not yet pinned down by a BIP may merge, but is not
+considered production ready until it is publicly specified. When
+maintainers proceed over a significant technical objection, the rationale
+is written up publicly.
+
+---
+
+## Licensing
+
+Crates in this workspace are licensed as declared in each crate's
+`Cargo.toml`: `MITNFA` for most crates, dual MIT/Apache-2.0 for
+`payjoin-ffi`. Relicensing the workspace to dual MIT/Apache-2.0 is in
+progress in [#1540](https://github.com/payjoin/rust-payjoin/issues/1540).
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be licensed under the license of the crate it modifies and
+dual MIT/Apache-2.0, without any additional terms or conditions.

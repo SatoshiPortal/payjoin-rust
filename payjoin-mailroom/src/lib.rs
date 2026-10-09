@@ -22,6 +22,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod directory;
+pub mod heartbeat;
 pub mod key_config;
 pub mod metrics;
 pub mod middleware;
@@ -46,7 +47,9 @@ struct Services {
 
 pub async fn serve(config: Config, meter_provider: Option<SdkMeterProvider>) -> anyhow::Result<()> {
     let sentinel_tag = generate_sentinel_tag();
-    let metrics = MetricsService::new(meter_provider);
+    let metrics = build_metrics(&config, meter_provider);
+    let flush_on_exit = metrics.clone();
+    spawn_heartbeat(metrics.clone());
 
     #[cfg(feature = "access-control")]
     let geoip = init_geoip(&config).await?;
@@ -76,7 +79,11 @@ pub async fn serve(config: Config, meter_provider: Option<SdkMeterProvider>) -> 
     let listener =
         Listener::bind(&config.listener, &system_options, &UserOptions::default()).await?;
     info!("Payjoin service listening on {:?}", listener.local_addr());
-    axum::serve(listener, app).await?;
+    tokio::select! {
+        served = axum::serve(listener, app) => served?,
+        () = shutdown_signal() => info!("Shutdown signal received"),
+    }
+    flush_on_exit.flush_windows();
 
     Ok(())
 }
@@ -169,7 +176,9 @@ pub async fn serve_acme(
         .ok_or_else(|| anyhow::anyhow!("ACME configuration is required for serve_acme"))?;
 
     let sentinel_tag = generate_sentinel_tag();
-    let metrics = MetricsService::new(meter_provider);
+    let metrics = build_metrics(&config, meter_provider);
+    let flush_on_exit = metrics.clone();
+    spawn_heartbeat(metrics.clone());
 
     #[cfg(feature = "access-control")]
     let geoip = init_geoip(&config).await?;
@@ -217,17 +226,66 @@ pub async fn serve_acme(
     });
 
     info!("Payjoin service listening on {} with ACME TLS", addr);
-    axum_server::bind(addr)
+    let server = axum_server::bind(addr)
         .acceptor(acceptor)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
-        .await?;
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+    tokio::select! {
+        served = server => served?,
+        () = shutdown_signal() => info!("Shutdown signal received"),
+    }
+    flush_on_exit.flush_windows();
     Ok(())
 }
 
 /// Generate random sentinel tag at startup.
 /// The relay and directory share this tag in a best-effort attempt
 /// at detecting self loops.
-fn generate_sentinel_tag() -> SentinelTag { SentinelTag::new(rand::thread_rng().gen()) }
+fn generate_sentinel_tag() -> SentinelTag { SentinelTag::new(rand::thread_rng().r#gen()) }
+
+/// Builds the metrics service for a server process.
+///
+/// Precise instruments always stay in-process. When an export provider is
+/// present, the only instruments registered on it are the coarse
+/// settled-window gauges: nothing precise or live leaves the operator
+/// boundary.
+fn build_metrics(config: &Config, export_provider: Option<SdkMeterProvider>) -> MetricsService {
+    match export_provider {
+        Some(provider) =>
+            MetricsService::with_export(&provider).with_persisted_windows(&config.storage_dir),
+        None => MetricsService::new(None),
+    }
+}
+
+/// Logs connection pressure once a minute for as long as the runtime lives.
+fn spawn_heartbeat(metrics: MetricsService) {
+    tokio::spawn(heartbeat::run(metrics, || tokio::time::sleep(heartbeat::HEARTBEAT_INTERVAL)));
+}
+
+/// Resolves on SIGINT or SIGTERM, the signals a terminal and systemd use to
+/// stop the service. Returning from the serve loop instead of dying in the
+/// default handler gives the weekly buckets a chance to reach disk.
+async fn shutdown_signal() {
+    let interrupt = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!(%err, "SIGTERM handler unavailable");
+                std::future::pending::<()>().await
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = interrupt => {}
+        () = terminate => {}
+    }
+}
 
 #[cfg(feature = "access-control")]
 impl Connected<IncomingStream<'_, Listener>> for middleware::MaybePeerIp {
@@ -456,25 +514,83 @@ mod tests {
     use super::*;
     use crate::metrics::{HTTP_REQUESTS_IN_FLIGHT, HTTP_REQUESTS_STARTED, HTTP_REQUESTS_TOTAL};
 
+    fn test_config(storage_dir: &std::path::Path) -> Config {
+        Config::new(
+            "[::]:0".parse().expect("valid listener address"),
+            storage_dir.to_path_buf(),
+            Duration::from_secs(2),
+            None,
+        )
+    }
+
     async fn start_service(
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> (u16, tokio::task::JoinHandle<anyhow::Result<()>>, tempfile::TempDir) {
         let tempdir = tempdir().unwrap();
-        let config = Config::new(
-            "[::]:0".parse().expect("valid listener address"),
-            tempdir.path().to_path_buf(),
-            Duration::from_secs(2),
-            None,
-        );
-
         let mut root_store = RootCertStore::empty();
         root_store.add(CertificateDer::from(cert_der.clone())).unwrap();
         let tls_config = RustlsConfig::from_der(vec![cert_der], key_der).await.unwrap();
 
         let (port, handle) =
-            serve_manual_tls(config, Some(tls_config), root_store, None).await.unwrap();
+            serve_manual_tls(test_config(tempdir.path()), Some(tls_config), root_store, None)
+                .await
+                .unwrap();
         (port, handle, tempdir)
+    }
+
+    /// Serves one request to `/health` from a fresh instance whose
+    /// access-control policy blocks `blocked_ips`, over TLS or in the clear,
+    /// and reports the status it answered with.
+    #[cfg(feature = "access-control")]
+    async fn health_status(tls: bool, blocked_ips: &[&str]) -> axum::http::StatusCode {
+        let tempdir = tempdir().unwrap();
+        let mut config = test_config(tempdir.path());
+        config.access_control = Some(crate::config::AccessControlConfig {
+            blocked_ips: blocked_ips.iter().map(|ip| ip.to_string()).collect(),
+            ..Default::default()
+        });
+
+        let cert = local_cert_key();
+        let cert_der = cert.cert.der().to_vec();
+        let key_der = cert.signing_key.serialize_der();
+        let tls_config = match tls {
+            true => Some(RustlsConfig::from_der(vec![cert_der.clone()], key_der).await.unwrap()),
+            false => None,
+        };
+        let mut root_store = RootCertStore::empty();
+        root_store.add(CertificateDer::from(cert_der.clone())).unwrap();
+
+        let (port, _handle) = serve_manual_tls(config, tls_config, root_store, None).await.unwrap();
+
+        let scheme = if tls { "https" } else { "http" };
+        http_agent(cert_der)
+            .unwrap()
+            .get(format!("{scheme}://localhost:{port}/health"))
+            .send()
+            .await
+            .expect("request should complete")
+            .status()
+    }
+
+    #[cfg(feature = "access-control")]
+    #[tokio::test]
+    async fn geoip_policy_is_enforced_on_the_manual_serve_paths() {
+        use axum::http::StatusCode;
+
+        for tls in [true, false] {
+            // 192.0.2.0/24 is TEST-NET-1, which no loopback client falls in.
+            assert_eq!(
+                health_status(tls, &["192.0.2.0/24"]).await,
+                StatusCode::OK,
+                "a peer outside the blocked range must be served (tls: {tls})"
+            );
+            assert_eq!(
+                health_status(tls, &["0.0.0.0/0", "::/0"]).await,
+                StatusCode::FORBIDDEN,
+                "a blocked source address must be refused (tls: {tls})"
+            );
+        }
     }
 
     #[tokio::test]
